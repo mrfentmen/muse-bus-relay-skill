@@ -130,13 +130,16 @@ def main():
     # --- live: wrong key on poller ---
     # Reset the room cursor first: the seen file is per-room, not per-nick,
     # so a fresh nick alone would still see NO_NEW_MESSAGES.
+    # Point key files at nonexistent paths so ONLY the wrong env key is tried.
     try:
         os.remove(os.path.join(BIN, "state", f"seen-{ROOM}.txt"))
     except OSError:
         pass
     p = run([os.path.join(BIN, "bus-poll"), "--room", ROOM],
             {"MUSE_RELAY_NICK": READER + "2",
-             "MUSE_RELAY_SIGN_KEY": "definitely-not-the-key"})
+             "MUSE_RELAY_SIGN_KEY": "definitely-not-the-key",
+             "MUSE_RELAY_CREW_KEY_FILE": "/nonexistent/crew.key",
+             "MUSE_RELAY_SIGN_KEY_FILE": "/nonexistent/sign.key"})
     check("live: wrong-key poller marks signed line [unverified]",
           "[unverified] tna-sender: hello signed" in p.stdout, p.stdout[-300:])
     try:
