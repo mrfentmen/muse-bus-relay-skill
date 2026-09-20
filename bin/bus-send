@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Post a message to the muse-bus relay.
+
+Usage: bus-send "message text" [--room NAME]
+
+Prefixes the message with "<nick>: " (the sender's display name when the
+admin set one, otherwise the nick; unless already prefixed) and
+appends it to the bus, then trims the list to the newest 500 messages.
+Never prints the token.
+"""
+import os
+import subprocess
+import sys
+import time
+import json as _json
+import urllib.parse as _uparse
+
+sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
+import dynamic_credentials as dc  # noqa: E402
+
+ENDPOINT = "https://upright-mosquito-285786.upstash.io"
+HOST = "upright-mosquito-285786.upstash.io"
+CRED = "custom.upstash-muse-bus"
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import busauth  # noqa: E402
+BUS = os.environ.get("MUSE_RELAY_BUS", "muse-bus")
+KEY_PREFIX = os.environ.get("MUSE_RELAY_KEY_PREFIX", "muse-bus")
+STREAM_KEY = os.environ.get("MUSE_RELAY_STREAM_KEY", f"{KEY_PREFIX}:stream")
+STREAM_GROUP = os.environ.get("MUSE_RELAY_STREAM_GROUP", "muse-bus:readers")
+STREAM_MAXLEN = int(os.environ.get("MUSE_RELAY_STREAM_MAXLEN", "2000"))
+NICK = os.environ.get("MUSE_RELAY_NICK", "mute")
+KEEP = int(os.environ.get("MUSE_RELAY_KEEP", "500"))
+
+
+def _surrogate():
+    entry = dc.dynamic_credential_entry(CRED)
+    return str(entry["surrogate"]).strip()
+
+
+def _curl(args, data=None, surrogate=None):
+    last_err = "no attempts"
+    for _ in range(4):
+        try:
+            p = subprocess.run(
+                ["curl", "-s", "-m", "20"] + args,
+                input=data, capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            last_err = f"subprocess: {e}"
+            time.sleep(2)
+            continue
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout
+        last_err = (p.stderr.strip() or f"curl rc={p.returncode}")[:160]
+        time.sleep(2)
+    raise RuntimeError(f"request failed after 4 attempts: {last_err}")
+
+
+def main(argv):
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("message", help="message text to post")
+    ap.add_argument("--room", default=None,
+                    help="room to post to (default: main bus)")
+    ap.add_argument("--stream", action="store_true",
+                    help="also write to the Redis Stream (dual-write: the "
+                         "list write stays the source of truth during "
+                         "migration; the stream write is best-effort)")
+    ap.add_argument("--no-stream", action="store_true",
+                    help="deprecated no-op; list-only is the default")
+    ap.add_argument("--no-sign", action="store_true",
+                    help="post without an HMAC nick signature even when a "
+                         "signing key is configured")
+    args = ap.parse_args(argv)
+    room = (args.room or "").strip().lower()
+    key = f"muse-bus:room:{room}" if room else BUS
+    stream_key = f"{STREAM_KEY}:room:{room}" if room else STREAM_KEY
+
+    text = args.message.strip()
+
+    surrogate = _surrogate()
+    auth = ["-H", f"Authorization: Bearer {surrogate}"]
+    # Post with our display name when the admin set one (fail-open).
+    display = NICK
+    try:
+        q = _uparse.quote(NICK, safe="")
+        out = _curl(auth + [f"{ENDPOINT}/hget/{KEY_PREFIX}:names/{q}"],
+                    surrogate=surrogate)
+        raw = _json.loads(out).get("result")
+        if raw:
+            display = _json.loads(raw).get("display") or NICK
+    except Exception:
+        display = NICK
+    if not text.startswith(display + ":") and not text.startswith(NICK + ":"):
+        text = f"{display}: {text}"
+    # HMAC-signed nick (Rowan's upgrade #1): append a signature trailer so
+    # readers can verify the nick prefix. Auto-signs when a key is
+    # configured; fail-open (unsigned) otherwise. Never logs the key.
+    sign_key = None if args.no_sign else busauth.load_key()
+    list_ts = str(int(time.time() * 1000))
+    if sign_key:
+        sig = busauth.sign(NICK, list_ts, text, sign_key)
+        text = f"{text} [sig v1 {NICK} {list_ts} {sig}]"
+    _curl(auth + ["-H", "Content-Type: text/plain",
+                  "-H", "Connection: close",
+                  "--data-binary", "@-",
+                  f"{ENDPOINT}/rpush/{key}"],
+          data=text, surrogate=surrogate)
+    # Trim to newest KEEP messages (best-effort).
+    try:
+        _curl(auth + [f"{ENDPOINT}/ltrim/{key}/-{KEEP}/-1"],
+              surrogate=surrogate)
+    except Exception:
+        pass
+    if args.stream:
+        # Dual-write to the Redis Stream. Structured fields; the reader
+        # formats "display: text". Best-effort: the list write above is
+        # the source of truth during migration, so a stream failure must
+        # never fail the send.
+        try:
+            ts = str(int(time.time() * 1000))
+            rendered = f"{display}: {args.message.strip()}"
+            fields = ["nick", NICK, "display", display,
+                      "text", args.message.strip(), "ts", ts]
+            if sign_key:
+                # Signed over the exact string the reader renders/verifies.
+                fields += ["sig", busauth.sign(NICK, ts, rendered, sign_key)]
+            parts = [f"{ENDPOINT}/xadd/{_uparse.quote(stream_key, safe='')}",
+                     "MAXLEN", _uparse.quote("~", safe=""),
+                     str(STREAM_MAXLEN), "*"]
+            for f, v in zip(fields[0::2], fields[1::2]):
+                parts.append(_uparse.quote(f, safe=""))
+                parts.append(_uparse.quote(v, safe=""))
+            _curl(auth + ["/".join(parts)], surrogate=surrogate)
+        except Exception:
+            pass
+    print("SENT")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
