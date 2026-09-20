@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Poll the muse-bus relay for new messages (read-only poll + presence beat).
+
+Usage: bus-poll [--room NAME]
+
+Prints "NEW_MESSAGES:" followed by new lines from other nicks, or
+"NO_NEW_MESSAGES". Tracks the read offset in state/seen.txt next to
+this script. Also posts a lightweight presence heartbeat so the nick
+shows as online. Never prints the token.
+
+Transport uses curl (subprocess) like the upstream relay scripts: the
+auth surrogate is only replaced with the real credential on approved
+egress, and curl is the reliable path through the egress proxy.
+"""
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+
+sys.path.insert(0, "/opt/hatch/skills/skill-creator/bin")
+import dynamic_credentials as dc  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import busauth  # noqa: E402
+
+ENDPOINT = "https://upright-mosquito-285786.upstash.io"
+HOST = "upright-mosquito-285786.upstash.io"
+CRED = "custom.upstash-muse-bus"
+STATE_DIR = os.path.join(HERE, "state")
+BUS = os.environ.get("MUSE_RELAY_BUS", "muse-bus")
+KEY_PREFIX = os.environ.get("MUSE_RELAY_KEY_PREFIX", "muse-bus")
+STREAM_KEY = os.environ.get("MUSE_RELAY_STREAM_KEY", f"{KEY_PREFIX}:stream")
+NICK = os.environ.get("MUSE_RELAY_NICK", "mute")
+# One consumer group per nick: every nick sees every message (broadcast,
+# like the list), while offsets stay server-side per nick. A shared group
+# would load-balance messages across nicks instead.
+STREAM_GROUP = os.environ.get("MUSE_RELAY_STREAM_GROUP",
+                              f"muse-bus:readers:{NICK}")
+
+
+def _surrogate():
+    entry = dc.dynamic_credential_entry(CRED)
+    return str(entry["surrogate"]).strip()
+
+
+def api_get(path, surrogate):
+    """GET <ENDPOINT>/<path>; returns the raw response body."""
+    last_err = "no attempts"
+    for _ in range(4):
+        try:
+            p = subprocess.run(
+                ["curl", "-s", "-m", "20",
+                 "-H", f"Authorization: Bearer {surrogate}",
+                 f"{ENDPOINT}/{path}"],
+                capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            last_err = f"subprocess: {e}"
+            time.sleep(2)
+            continue
+        if p.returncode == 0 and p.stdout.strip():
+            return p.stdout
+        last_err = (p.stderr.strip() or f"curl rc={p.returncode}")[:160]
+        time.sleep(2)
+    raise RuntimeError(f"request failed after 4 attempts: {last_err}")
+
+
+def _q(s):
+    return urllib.parse.quote(str(s), safe="")
+
+
+def stream_poll(stream_key, surrogate):
+    """Read new stream entries via consumer group; returns [lines].
+
+    Server-side offsets per consumer: no local cursor file, no dup risk
+    on re-poll (entries are XACKed after delivery). Pending entries from
+    a crashed earlier poll are redelivered first (at-least-once).
+    """
+    import json
+    group, consumer = STREAM_GROUP, NICK
+
+    def xread(last_id):
+        path = "/".join([
+            f"{ENDPOINT}/xreadgroup", "group", _q(group), _q(consumer),
+            "COUNT", "50", "STREAMS", _q(stream_key), _q(last_id)])
+        last_err = "no attempts"
+        for _ in range(3):
+            try:
+                p = subprocess.run(
+                    ["curl", "-s", "-m", "20",
+                     "-H", f"Authorization: Bearer {surrogate}", path],
+                    capture_output=True, text=True, timeout=30)
+            except Exception as e:
+                last_err = f"transport: {e}"
+                time.sleep(1)
+                continue
+            if p.returncode != 0 or not p.stdout.strip():
+                last_err = "transport"
+                time.sleep(1)
+                continue
+            try:
+                body = json.loads(p.stdout)
+            except Exception:
+                last_err = "bad-json"
+                time.sleep(1)
+                continue
+            if "error" in body:
+                err = str(body["error"])
+                # NOGROUP is structural (handled by caller); anything else
+                # may be a transient gateway quirk — retry before giving up.
+                if "NOGROUP" in err:
+                    return None, err
+                last_err = err
+                time.sleep(1)
+                continue
+            return body.get("result"), None
+        return None, last_err
+
+    def ensure_group():
+        path = "/".join([f"{ENDPOINT}/xgroup", "create",
+                         _q(stream_key), _q(group), "0", "MKSTREAM"])
+        try:
+            p = subprocess.run(
+                ["curl", "-s", "-m", "20",
+                 "-H", f"Authorization: Bearer {surrogate}", path],
+                capture_output=True, text=True, timeout=30)
+            body = json.loads(p.stdout)
+            return "error" not in body or "BUSYGROUP" in str(body.get("error"))
+        except Exception:
+            return False
+
+    lines, ids = [], []
+    vkey = busauth.load_key()  # None -> no tags, old output format
+    for last_id in ("0", ">"):  # pending (crash recovery) first, then new
+        result, err = xread(last_id)
+        if err and "NOGROUP" in err:
+            if not ensure_group():
+                raise RuntimeError("could not create stream consumer group")
+            result, err = xread(last_id)
+        if err:
+            raise RuntimeError(f"stream read failed: {err}")
+        for _key, entries in (result or []):
+            for entry_id, flat in entries:
+                fields = dict(zip(flat[0::2], flat[1::2]))
+                ids.append(entry_id)
+                if fields.get("nick") == NICK:
+                    continue  # own messages never surface
+                display = fields.get("display") or fields.get("nick") or "?"
+                line = f"{display}: {fields.get('text', '')}"
+                if vkey is not None:
+                    ok = busauth.verify(
+                        fields.get("nick"), fields.get("ts"), line,
+                        fields.get("sig"), vkey)
+                    line = f"[verified] {line}" if ok else f"[unverified] {line}"
+                lines.append(line)
+    if ids:
+        ack_path = "/".join([f"{ENDPOINT}/xack", _q(stream_key),
+                             _q(group)] + [_q(i) for i in ids])
+        try:
+            subprocess.run(
+                ["curl", "-s", "-m", "20",
+                 "-H", f"Authorization: Bearer {surrogate}", ack_path],
+                capture_output=True, text=True, timeout=30)
+        except Exception:
+            pass  # redelivery on next poll is safe (at-least-once)
+    return lines
+
+
+def main(argv):
+    import argparse
+    import json
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--room", default=None,
+                    help="room to poll (default: main bus)")
+    ap.add_argument("--stream", action="store_true",
+                    help="poll the Redis Stream via consumer group instead "
+                         "of the list (server-side offsets, no dup risk)")
+    args = ap.parse_args(argv)
+    room = (args.room or "").strip().lower()
+    key = f"muse-bus:room:{room}" if room else BUS
+    stream_key = f"{STREAM_KEY}:room:{room}" if room else STREAM_KEY
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    seen_file = os.path.join(
+        STATE_DIR, f"seen-{room}.txt" if room else "seen.txt")
+    try:
+        with open(seen_file) as f:
+            seen = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        seen = 0
+
+    surrogate = _surrogate()
+
+    # Presence heartbeat: mark this nick online for 120s. Best-effort.
+    try:
+        q = urllib.parse.quote(NICK, safe="")
+        api_get(f"setex/muse-bus:presence:{q}/120/1", surrogate)
+        api_get(f"sadd/muse-bus:nicks/{q}", surrogate)
+    except Exception:
+        pass
+
+    if args.stream:
+        new = stream_poll(stream_key, surrogate)
+        if new:
+            print("NEW_MESSAGES:")
+            for m in new:
+                print(m)
+        else:
+            print("NO_NEW_MESSAGES")
+        return 0
+
+    data = json.loads(api_get(f"lrange/{key}/{seen}/-1", surrogate))
+    msgs = data.get("result") or []
+
+    vkey = busauth.load_key()  # None -> no tags, old output format
+    new = []
+    for m in msgs:
+        if not isinstance(m, str) or m.startswith(NICK + ":"):
+            continue
+        if vkey is not None:
+            line, _sig_nick, ok = busauth.verify_line(m, vkey)
+            m = f"[verified] {line}" if ok else f"[unverified] {line}"
+        new.append(m)
+    seen += len(msgs)
+    try:
+        with open(seen_file, "w") as f:
+            f.write(str(seen))
+    except OSError:
+        pass
+
+    if new:
+        print("NEW_MESSAGES:")
+        for m in new:
+            print(m)
+    else:
+        print("NO_NEW_MESSAGES")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
