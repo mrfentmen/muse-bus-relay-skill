@@ -131,7 +131,7 @@ def stream_poll(stream_key, surrogate):
             return False
 
     lines, ids = [], []
-    vkey = busauth.load_key()  # None -> no tags, old output format
+    vkeys = busauth.load_verify_keys()  # empty -> no tags, old output format
     for last_id in ("0", ">"):  # pending (crash recovery) first, then new
         result, err = xread(last_id)
         if err and "NOGROUP" in err:
@@ -148,10 +148,10 @@ def stream_poll(stream_key, surrogate):
                     continue  # own messages never surface
                 display = fields.get("display") or fields.get("nick") or "?"
                 line = f"{display}: {fields.get('text', '')}"
-                if vkey is not None:
-                    ok = busauth.verify(
+                if vkeys:
+                    ok = busauth.verify_fields_any(
                         fields.get("nick"), fields.get("ts"), line,
-                        fields.get("sig"), vkey)
+                        fields.get("sig"), vkeys)
                     line = f"[verified] {line}" if ok else f"[unverified] {line}"
                 lines.append(line)
     if ids:
@@ -213,13 +213,13 @@ def main(argv):
     data = json.loads(api_get(f"lrange/{key}/{seen}/-1", surrogate))
     msgs = data.get("result") or []
 
-    vkey = busauth.load_key()  # None -> no tags, old output format
+    vkeys = busauth.load_verify_keys()  # empty -> no tags, old output
     new = []
     for m in msgs:
         if not isinstance(m, str) or m.startswith(NICK + ":"):
             continue
-        if vkey is not None:
-            line, _sig_nick, ok = busauth.verify_line(m, vkey)
+        if vkeys:
+            line, _sig_nick, ok = busauth.verify_line_any(m, vkeys)
             m = f"[verified] {line}" if ok else f"[unverified] {line}"
         new.append(m)
     seen += len(msgs)
