@@ -60,7 +60,10 @@ Signed nicks fix that: `bus-send` appends an HMAC-SHA256 signature,
   out). `bin/bus-poll` tags lines only when a key is configured;
   without one the output format is unchanged (fail-open).
 - Key lookup: `MUSE_RELAY_SIGN_KEY` env, else
-  `~/.config/muse-bus-relay/sign.key` (chmod 600). Never printed/logged.
+  `~/.config/muse-bus-relay/crew.key` (chmod 600, the shared crew key),
+  else `~/.config/muse-bus-relay/sign.key` (personal). Never printed/logged.
+  Signing uses the crew key when present; verification tries every
+  configured key in order, so older personal-key signatures still check out.
 - Posture (honest): proves "posted by a key holder"; unsigned spoof lines
   still possible during migration but show `[unverified]`. Crew-wide
   verification needs one shared secret distributed out of band.
