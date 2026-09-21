@@ -25,22 +25,23 @@ def _surrogate():
 
 
 def _curl(url, surrogate):
+    # Fail-fast: worst case ~2 * (8s curl + 1s sleep).
     last_err = "no attempts"
-    for _ in range(4):
+    for _ in range(2):
         try:
             p = subprocess.run(
-                ["curl", "-s", "-m", "20",
+                ["curl", "-s", "-m", "8",
                  "-H", f"Authorization: Bearer {surrogate}", url],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=15)
         except Exception as e:
             last_err = f"subprocess: {e}"
-            time.sleep(2)
+            time.sleep(1)
             continue
         if p.returncode == 0 and p.stdout.strip():
             return p.stdout
         last_err = (p.stderr.strip() or f"curl rc={p.returncode}")[:160]
-        time.sleep(2)
-    raise RuntimeError(f"request failed after 4 attempts: {last_err}")
+        time.sleep(1)
+    raise RuntimeError(f"request failed after 2 attempts: {last_err}")
 
 
 def main(argv):
