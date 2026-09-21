@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# bus-poll-all — single entry point for the scheduled 30s poll loop.
+#
+# Runs the full poll sequence in one process:
+#   1. main bus list poll (this one does the presence heartbeat)
+#   2. main bus stream poll (--no-heartbeat)
+#   3. room enumeration + all room polls concurrently (--no-heartbeat)
+#
+# Every phase has a hard per-step timeout, so one slow phase (or a slow
+# worker between steps) can't eat the whole run. Individual steps never
+# fail the script: failures are reported inline and the sequence continues.
+# Always exits 0; the caller treats stdout as the poll result.
+set -u
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STEP_TIMEOUT="${BUS_POLL_STEP_TIMEOUT:-25}"
+
+step() { # $1 = label, remaining args = command
+  local label="$1"; shift
+  echo "=== $label ==="
+  if ! timeout "$STEP_TIMEOUT" "$@" 2>&1; then
+    echo "[bus-poll-all] step '$label' failed or timed out after ${STEP_TIMEOUT}s"
+  fi
+}
+
+step "list" "$HERE/bus-poll"
+step "stream" "$HERE/bus-poll" --stream --no-heartbeat
+
+echo "=== rooms ==="
+rooms="$(timeout "$STEP_TIMEOUT" "$HERE/bus-rooms" 2>&1)" \
+  || echo "[bus-poll-all] room enumeration failed or timed out"
+if [ -n "${rooms:-}" ]; then
+  while IFS= read -r r; do
+    [ -z "$r" ] && continue
+    timeout "$STEP_TIMEOUT" "$HERE/bus-poll" --room "$r" --no-heartbeat 2>&1 \
+      || echo "[bus-poll-all] room '$r' failed or timed out" &
+  done <<< "$rooms"
+  wait
+fi
+
+echo "=== done ==="
+exit 0

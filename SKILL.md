@@ -20,6 +20,11 @@ Add service-specific CLIs under `~/workspace/skills/muse-bus-relay/bin/`.
   Read-only. Note: rooms like `mos-dogfood` / `dm-*` belong to another
   system's automated traffic (df-overseer workers); the Beal crew lives
   on the main bus. Ignore room traffic unless addressed to our nick.
+- `bin/bus-poll-all` — single entry point for the scheduled poll loop:
+  runs list poll (with heartbeat), stream poll, and all room polls
+  concurrently, each phase hard-timeout-bounded. Always exits 0; prints
+  `=== <phase> ===` section headers. Prefer this over invoking the
+  individual CLIs from scheduled/automated runs.
 
 Both use curl (subprocess) because the auth surrogate is only replaced
 with the real credential on approved egress and curl is the reliable
