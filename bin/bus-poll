@@ -45,25 +45,30 @@ def _surrogate():
     return str(entry["surrogate"]).strip()
 
 
-def api_get(path, surrogate):
-    """GET <ENDPOINT>/<path>; returns the raw response body."""
+def api_get(path, surrogate, attempts=2):
+    """GET <ENDPOINT>/<path>; returns the raw response body.
+
+    Fail-fast by design: this runs on a 30s poll cadence, so a stalled
+    call burns its attempts quickly and the next run retries. Worst case
+    per call is ~attempts * (8s curl + 1s sleep).
+    """
     last_err = "no attempts"
-    for _ in range(4):
+    for _ in range(attempts):
         try:
             p = subprocess.run(
-                ["curl", "-s", "-m", "20",
+                ["curl", "-s", "-m", "8",
                  "-H", f"Authorization: Bearer {surrogate}",
                  f"{ENDPOINT}/{path}"],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=15)
         except Exception as e:
             last_err = f"subprocess: {e}"
-            time.sleep(2)
+            time.sleep(1)
             continue
         if p.returncode == 0 and p.stdout.strip():
             return p.stdout
         last_err = (p.stderr.strip() or f"curl rc={p.returncode}")[:160]
-        time.sleep(2)
-    raise RuntimeError(f"request failed after 4 attempts: {last_err}")
+        time.sleep(1)
+    raise RuntimeError(f"request failed after {attempts} attempts: {last_err}")
 
 
 def _q(s):
@@ -85,12 +90,12 @@ def stream_poll(stream_key, surrogate):
             f"{ENDPOINT}/xreadgroup", "group", _q(group), _q(consumer),
             "COUNT", "50", "STREAMS", _q(stream_key), _q(last_id)])
         last_err = "no attempts"
-        for _ in range(3):
+        for _ in range(2):
             try:
                 p = subprocess.run(
-                    ["curl", "-s", "-m", "20",
+                    ["curl", "-s", "-m", "8",
                      "-H", f"Authorization: Bearer {surrogate}", path],
-                    capture_output=True, text=True, timeout=30)
+                    capture_output=True, text=True, timeout=15)
             except Exception as e:
                 last_err = f"transport: {e}"
                 time.sleep(1)
@@ -122,9 +127,9 @@ def stream_poll(stream_key, surrogate):
                          _q(stream_key), _q(group), "0", "MKSTREAM"])
         try:
             p = subprocess.run(
-                ["curl", "-s", "-m", "20",
+                ["curl", "-s", "-m", "8",
                  "-H", f"Authorization: Bearer {surrogate}", path],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=15)
             body = json.loads(p.stdout)
             return "error" not in body or "BUSYGROUP" in str(body.get("error"))
         except Exception:
@@ -159,9 +164,9 @@ def stream_poll(stream_key, surrogate):
                              _q(group)] + [_q(i) for i in ids])
         try:
             subprocess.run(
-                ["curl", "-s", "-m", "20",
+                ["curl", "-s", "-m", "8",
                  "-H", f"Authorization: Bearer {surrogate}", ack_path],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, timeout=15)
         except Exception:
             pass  # redelivery on next poll is safe (at-least-once)
     return lines
@@ -176,6 +181,9 @@ def main(argv):
     ap.add_argument("--stream", action="store_true",
                     help="poll the Redis Stream via consumer group instead "
                          "of the list (server-side offsets, no dup risk)")
+    ap.add_argument("--no-heartbeat", action="store_true",
+                    help="skip the presence heartbeat (the main list poll "
+                         "already heartbeats every run)")
     args = ap.parse_args(argv)
     room = (args.room or "").strip().lower()
     key = f"muse-bus:room:{room}" if room else BUS
@@ -192,13 +200,18 @@ def main(argv):
 
     surrogate = _surrogate()
 
-    # Presence heartbeat: mark this nick online for 120s. Best-effort.
-    try:
-        q = urllib.parse.quote(NICK, safe="")
-        api_get(f"setex/muse-bus:presence:{q}/120/1", surrogate)
-        api_get(f"sadd/muse-bus:nicks/{q}", surrogate)
-    except Exception:
-        pass
+    # Presence heartbeat: mark this nick online for 120s. Best-effort,
+    # single attempt, and skipped entirely for room/stream polls — the
+    # main list poll heartbeats every run, so repeating it 4x per run
+    # just multiplies worst-case stall time.
+    if not args.no_heartbeat:
+        try:
+            q = urllib.parse.quote(NICK, safe="")
+            api_get(f"setex/muse-bus:presence:{q}/120/1", surrogate,
+                    attempts=1)
+            api_get(f"sadd/muse-bus:nicks/{q}", surrogate, attempts=1)
+        except Exception:
+            pass
 
     if args.stream:
         new = stream_poll(stream_key, surrogate)
